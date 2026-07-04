@@ -1,0 +1,92 @@
+#!/bin/bash
+#
+# install_mariadb.sh
+# Install MariaDB (standalone) via official MariaDB APT repository
+#
+# Usage:
+#   sudo ./install_mariadb.sh                  # install latest stable
+#   sudo ./install_mariadb.sh 11.4             # pin to specific version
+#
+
+set -euo pipefail
+
+MARIADB_VERSION="${1:-}"
+LOG_FILE="/var/log/install_mariadb.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# --- Root check ---
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root (use sudo)." >&2
+    exit 1
+fi
+
+# --- Already installed check ---
+if command -v mariadb >/dev/null 2>&1; then
+    CURRENT_VERSION=$(mariadb --version)
+    log "MariaDB already installed: $CURRENT_VERSION"
+    read -rp "MariaDB is already installed. Continue anyway? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log "Aborted by user."
+        exit 0
+    fi
+fi
+
+log "Starting MariaDB installation..."
+
+# --- Dependencies for repo setup script ---
+apt update -qq
+apt install -y curl gnupg lsb-release >>"$LOG_FILE" 2>&1
+
+# --- Download repo setup script ---
+TMP_DIR=$(mktemp -d)
+cd "$TMP_DIR"
+log "Downloading MariaDB repo setup script..."
+curl -LsS -O https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+
+chmod +x mariadb_repo_setup
+
+# --- Run repo setup (pinned version or latest) ---
+if [[ -n "$MARIADB_VERSION" ]]; then
+    log "Setting up repo for MariaDB version: $MARIADB_VERSION"
+    ./mariadb_repo_setup --mariadb-server-version="mariadb-${MARIADB_VERSION}" >>"$LOG_FILE" 2>&1
+else
+    log "Setting up repo for latest stable MariaDB"
+    ./mariadb_repo_setup >>"$LOG_FILE" 2>&1
+fi
+
+# --- Install server + client ---
+log "Updating package list..."
+apt update -qq
+
+log "Installing mariadb-server and mariadb-client..."
+apt install -y mariadb-server mariadb-client >>"$LOG_FILE" 2>&1
+
+# --- Enable and start service ---
+log "Enabling and starting mariadb service..."
+systemctl enable --now mariadb
+
+if systemctl is-active --quiet mariadb; then
+    log "MariaDB service is running."
+else
+    log "ERROR: MariaDB service failed to start. Check: systemctl status mariadb"
+    exit 1
+fi
+
+INSTALLED_VERSION=$(mariadb --version)
+log "Installed: $INSTALLED_VERSION"
+
+# --- Cleanup ---
+cd /
+rm -rf "$TMP_DIR"
+
+echo ""
+echo "=================================================="
+echo " MariaDB installed successfully."
+echo " Version : $INSTALLED_VERSION"
+echo ""
+echo " Next step (recommended): run security hardening"
+echo "   sudo mariadb-secure-installation"
+echo "=================================================="
