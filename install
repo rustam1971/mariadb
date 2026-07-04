@@ -1,20 +1,40 @@
 #!/bin/bash
 #
-# install_mariadb.sh
+# install
 # Install MariaDB (standalone) via official MariaDB APT repository
+# Optionally installs phpMyAdmin as well.
 #
 # Usage:
-#   sudo ./install_mariadb.sh                  # install latest stable
-#   sudo ./install_mariadb.sh 11.4             # pin to specific version
+#   wget -qO- https://raw.githubusercontent.com/rustam1971/mariadb/main/install | sudo bash
+#
+#   Pin a version or add phpMyAdmin by setting env vars before piping:
+#   MARIADB_VERSION=11.4 WITH_PHPMYADMIN=1 wget -qO- https://raw.githubusercontent.com/rustam1971/mariadb/main/install | sudo -E bash
+#
+#   Or run locally:
+#   sudo ./install 11.4 --with-phpmyadmin
 #
 
 set -euo pipefail
 
-MARIADB_VERSION="${1:-}"
+MARIADB_VERSION="${MARIADB_VERSION:-}"
+WITH_PHPMYADMIN="${WITH_PHPMYADMIN:-false}"
+[[ "$WITH_PHPMYADMIN" == "1" ]] && WITH_PHPMYADMIN=true
+
+for arg in "$@"; do
+    case "$arg" in
+        --with-phpmyadmin)
+            WITH_PHPMYADMIN=true
+            ;;
+        *)
+            MARIADB_VERSION="$arg"
+            ;;
+    esac
+done
+
 LOG_FILE="/var/log/install_mariadb.log"
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
 # --- Root check ---
@@ -37,14 +57,14 @@ fi
 log "Starting MariaDB installation..."
 
 # --- Dependencies for repo setup script ---
-apt update -qq
+apt update -qq >>"$LOG_FILE" 2>&1
 apt install -y curl gnupg lsb-release >>"$LOG_FILE" 2>&1
 
 # --- Download repo setup script ---
 TMP_DIR=$(mktemp -d)
 cd "$TMP_DIR"
 log "Downloading MariaDB repo setup script..."
-curl -LsS -O https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+curl -LsS -O https://downloads.mariadb.com/MariaDB/mariadb_repo_setup >>"$LOG_FILE" 2>&1
 
 chmod +x mariadb_repo_setup
 
@@ -59,14 +79,14 @@ fi
 
 # --- Install server + client ---
 log "Updating package list..."
-apt update -qq
+apt update -qq >>"$LOG_FILE" 2>&1
 
 log "Installing mariadb-server and mariadb-client..."
 apt install -y mariadb-server mariadb-client >>"$LOG_FILE" 2>&1
 
 # --- Enable and start service ---
 log "Enabling and starting mariadb service..."
-systemctl enable --now mariadb
+systemctl enable --now mariadb >>"$LOG_FILE" 2>&1
 
 if systemctl is-active --quiet mariadb; then
     log "MariaDB service is running."
@@ -78,6 +98,48 @@ fi
 INSTALLED_VERSION=$(mariadb --version)
 log "Installed: $INSTALLED_VERSION"
 
+# --- Optional: phpMyAdmin ---
+PMA_INFO=""
+if [[ "$WITH_PHPMYADMIN" == true ]]; then
+    log "Installing phpMyAdmin..."
+
+    # Install a web server if none of the common ones are present
+    if ! command -v apache2 >/dev/null 2>&1 && ! command -v nginx >/dev/null 2>&1; then
+        log "No web server detected, installing apache2..."
+        apt install -y apache2 >>"$LOG_FILE" 2>&1
+    fi
+
+    apt install -y php php-mbstring php-zip php-gd php-json php-curl php-mysql >>"$LOG_FILE" 2>&1
+
+    # Generate random passwords for phpMyAdmin's dbconfig setup
+    PMA_APP_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+
+    log "Preseeding phpMyAdmin debconf answers (non-interactive install)..."
+    debconf-set-selections <<EOF
+phpmyadmin phpmyadmin/dbconfig-install boolean true
+phpmyadmin phpmyadmin/app-password-confirm password ${PMA_APP_PASS}
+phpmyadmin phpmyadmin/mysql/app-pass password ${PMA_APP_PASS}
+phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2
+EOF
+
+    DEBIAN_FRONTEND=noninteractive apt install -y phpmyadmin >>"$LOG_FILE" 2>&1
+
+    # Enable required apache/php modules if apache2 is used
+    if command -v apache2 >/dev/null 2>&1; then
+        a2enconf phpmyadmin >>"$LOG_FILE" 2>&1 || true
+        systemctl restart apache2 >>"$LOG_FILE" 2>&1
+    fi
+
+    if systemctl is-active --quiet apache2 2>/dev/null || systemctl is-active --quiet nginx 2>/dev/null; then
+        log "phpMyAdmin installed successfully."
+        PMA_INFO="phpMyAdmin  : http://<server-ip>/phpmyadmin
+ phpMyAdmin app DB password (auto-generated): ${PMA_APP_PASS}
+ (this password is for phpMyAdmin's internal config storage DB, NOT your MariaDB root password)"
+    else
+        log "WARNING: web server not active, check phpMyAdmin manually."
+    fi
+fi
+
 # --- Cleanup ---
 cd /
 rm -rf "$TMP_DIR"
@@ -86,6 +148,10 @@ echo ""
 echo "=================================================="
 echo " MariaDB installed successfully."
 echo " Version : $INSTALLED_VERSION"
+if [[ -n "$PMA_INFO" ]]; then
+    echo ""
+    echo " $PMA_INFO"
+fi
 echo ""
 echo " Next step (recommended): run security hardening"
 echo "   sudo mariadb-secure-installation"
